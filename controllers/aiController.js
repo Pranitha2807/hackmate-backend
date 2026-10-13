@@ -2,14 +2,22 @@ import { GoogleGenAI } from "@google/genai";
 import User from "../models/User.js";
 import Team from "../models/Team.js";
 
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 export const matchTeams = async (req, res) => {
   try {
-    // Create Gemini client after environment variables are loaded
-    const ai = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-    });
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    // Get logged-in user
+    if (!apiKey) {
+      console.error("GEMINI_API_KEY is missing");
+      return res.status(500).json({
+        message: "AI service is not configured.",
+      });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
     const user = await User.findById(req.user).select("-password");
 
     if (!user) {
@@ -18,7 +26,6 @@ export const matchTeams = async (req, res) => {
       });
     }
 
-    // Get available teams
     const teams = await Team.find()
       .populate("leader", "fullName")
       .populate("members", "fullName");
@@ -39,61 +46,138 @@ export const matchTeams = async (req, res) => {
     }));
 
     const prompt = `
-You are the AI matching assistant for HackMate.
+You are HackMate's AI team-matching assistant.
 
-Your job is to recommend the best teams for a student based on their skills.
+Recommend up to 3 suitable teams for this student.
 
 Student:
 Name: ${user.fullName}
-Skills: ${user.skills || "No skills provided"}
+Skills: ${JSON.stringify(user.skills || [])}
 Branch: ${user.branch || "Not provided"}
 Year: ${user.year || "Not provided"}
 
-Available Teams:
-${JSON.stringify(teamData, null, 2)}
+Available teams:
+${JSON.stringify(teamData)}
 
-Analyze the student's skills against the required skills of each team.
-
-Return ONLY valid JSON in this exact format:
-
+Return ONLY valid JSON:
 {
   "recommendations": [
     {
-      "teamId": "team id",
-      "teamName": "team name",
+      "teamId": "exact team id",
+      "teamName": "exact team name",
       "matchScore": 90,
-      "reason": "Short explanation of why this team is a good match."
+      "reason": "Short explanation"
     }
   ]
 }
 
 Rules:
-- Return at most 3 recommendations.
-- Match score must be between 0 and 100.
-- Higher scores mean stronger skill matches.
-- Consider related or transferable skills.
-- Do not invent teams.
-- Use only teams provided above.
+- Recommend at most 3 teams.
+- Use only the provided teams.
+- Match scores must be between 0 and 100.
+- Consider transferable skills.
 - Keep reasons short and clear.
+- Return an empty recommendations array if appropriate.
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-      },
-    });
+    const models = [
+      process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      process.env.GEMINI_FALLBACK_MODEL || "gemini-2.0-flash",
+    ];
 
-    const result = JSON.parse(response.text);
+    let response = null;
+    let lastError = null;
 
-    res.status(200).json(result);
+    for (const model of [...new Set(models)]) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(
+            `AI matching: trying ${model}, attempt ${attempt}`
+          );
+
+          response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+            },
+          });
+
+          if (response?.text) {
+            break;
+          }
+
+          throw new Error("Gemini returned an empty response");
+        } catch (error) {
+          lastError = error;
+
+          const status = Number(error.status || error.code);
+
+          console.error(
+            `Gemini model ${model} failed:`,
+            status,
+            error.message
+          );
+
+          const retryable = [
+            429, 500, 502, 503, 504,
+          ].includes(status);
+
+          if (!retryable || attempt === 2) {
+            break;
+          }
+
+          await sleep(1500);
+        }
+      }
+
+      if (response?.text) {
+        break;
+      }
+    }
+
+    if (!response?.text) {
+      console.error(
+        "All Gemini models failed:",
+        lastError?.message
+      );
+
+      return res.status(503).json({
+        message:
+          "AI matching is temporarily unavailable. Please try again shortly.",
+      });
+    }
+
+    let result;
+
+    try {
+      result = JSON.parse(response.text);
+    } catch {
+      return res.status(502).json({
+        message: "AI returned an invalid response. Please try again.",
+      });
+    }
+
+    if (!Array.isArray(result.recommendations)) {
+      return res.status(502).json({
+        message: "AI returned an unexpected response format.",
+      });
+    }
+
+    const validTeamIds = new Set(
+      teamData.map((team) => team.id)
+    );
+
+    result.recommendations = result.recommendations
+      .filter((item) => validTeamIds.has(item.teamId))
+      .slice(0, 3);
+
+    return res.status(200).json(result);
   } catch (error) {
     console.error("AI Team Matching Error:", error);
 
-    res.status(500).json({
-      message: "AI team matching failed",
-      error: error.message,
+    return res.status(500).json({
+      message: "AI team matching failed. Please try again.",
     });
   }
 };
