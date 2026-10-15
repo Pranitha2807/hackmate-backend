@@ -1,3 +1,4 @@
+
 import { GoogleGenAI } from "@google/genai";
 import User from "../models/User.js";
 import Team from "../models/Team.js";
@@ -81,8 +82,9 @@ Rules:
 `;
 
     const models = [
-      process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      process.env.GEMINI_FALLBACK_MODEL || "gemini-2.0-flash",
+      process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
+      process.env.GEMINI_FALLBACK_MODEL || "gemini-2.5-flash",
+      "gemini-2.0-flash",
     ];
 
     let response = null;
@@ -110,6 +112,7 @@ Rules:
           throw new Error("Gemini returned an empty response");
         } catch (error) {
           lastError = error;
+          response = null;
 
           const status = Number(error.status || error.code);
 
@@ -152,7 +155,9 @@ Rules:
 
     try {
       result = JSON.parse(response.text);
-    } catch {
+    } catch (error) {
+      console.error("Invalid Gemini JSON:", error.message);
+
       return res.status(502).json({
         message: "AI returned an invalid response. Please try again.",
       });
@@ -164,13 +169,24 @@ Rules:
       });
     }
 
-    const validTeamIds = new Set(
-      teamData.map((team) => team.id)
+    const validTeams = new Map(
+      teamData.map((team) => [team.id, team])
     );
 
     result.recommendations = result.recommendations
-      .filter((item) => validTeamIds.has(item.teamId))
-      .slice(0, 3);
+      .filter((item) => validTeams.has(item.teamId))
+      .slice(0, 3)
+      .map((item) => ({
+        ...item,
+        teamName: validTeams.get(item.teamId).teamName,
+        matchScore: Math.max(
+          0,
+          Math.min(100, Number(item.matchScore) || 0)
+        ),
+        reason: String(
+          item.reason || "Skills may be a good match."
+        ),
+      }));
 
     return res.status(200).json(result);
   } catch (error) {
